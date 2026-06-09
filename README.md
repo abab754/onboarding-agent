@@ -15,8 +15,11 @@ An MCP server that onboards you to any codebase. Point it at a repo, and it buil
 Requires Python 3.12+.
 
 ```bash
-# With uv (recommended)
-uv pip install git+https://github.com/abab754/onboarding-agent.git
+# From PyPI (recommended)
+uv pip install onboarding-agent
+
+# Or run directly without installing
+uvx onboarding-agent
 
 # Or clone and install locally
 git clone https://github.com/abab754/onboarding-agent.git
