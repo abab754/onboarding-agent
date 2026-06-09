@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
@@ -57,6 +58,7 @@ def ingest_repo(repo_path: str) -> dict:
     Returns:
         A dict with the repo name, root path, file tree, and summary stats.
     """
+    global _current_repo_path
     root = Path(repo_path).expanduser().resolve()
 
     if not root.exists():
@@ -64,6 +66,7 @@ def ingest_repo(repo_path: str) -> dict:
     if not root.is_dir():
         return {"error": f"Path is not a directory: {root}"}
 
+    _current_repo_path = str(root)
     tree = build_file_tree(root)
 
     # Count files and directories for a quick summary
@@ -397,17 +400,18 @@ def explain_module(module_path: str, repo_path: str | None = None) -> dict:
     return response
 
 
-# Global knowledge graph instance — persists to .onboarding_agent/graph.json
-# inside the repo being analyzed.
+# Global state — tracks the currently analyzed repo and its knowledge graph.
 _graph: KnowledgeGraph | None = None
+_current_repo_path: str | None = None
 
 
 def _get_or_create_graph(repo_path: str) -> KnowledgeGraph:
     """Get the current graph or create one backed by a file in the target repo."""
-    global _graph
+    global _graph, _current_repo_path
     storage = Path(repo_path) / ".onboarding_agent" / "graph.json"
     if _graph is None or _graph.storage_path != storage:
         _graph = KnowledgeGraph(str(storage))
+        _current_repo_path = str(Path(repo_path).resolve())
     return _graph
 
 
@@ -546,6 +550,331 @@ def query_relationships(
 
     results = graph.find_relationships(source=source, target=target, rel_type=rel_type)
     return {"count": len(results), "relationships": results}
+
+
+@mcp.tool()
+def find_relevant_code(repo_path: str, query: str) -> dict:
+    """Given a topic or question, find the most relevant files, functions, and classes in the codebase.
+
+    Searches entity names, file paths, and import statements in the knowledge graph.
+    Returns matching entities ranked by relevance, plus the content of the top matching files.
+
+    Args:
+        repo_path: Absolute path to the repo.
+        query: A topic, keyword, or question (e.g., "authentication", "database", "error handling").
+
+    Returns:
+        A dict with matching entities grouped by type and content of top file matches.
+    """
+    graph = _get_or_create_graph(repo_path)
+    if not graph.entities:
+        return {"error": "No knowledge graph found. Run build_knowledge_graph first."}
+
+    query_lower = query.lower()
+    query_terms = query_lower.split()
+
+    scored: list[tuple[float, dict]] = []
+    for entity in graph.entities.values():
+        score = 0.0
+        name_lower = entity["name"].lower()
+        id_lower = entity["id"].lower()
+        meta_str = str(entity.get("metadata", {})).lower()
+
+        for term in query_terms:
+            if term in name_lower:
+                score += 3.0
+            if term in id_lower:
+                score += 1.0
+            if term in meta_str:
+                score += 0.5
+
+        # Boost files over individual symbols — they provide more context
+        if entity["type"] == "file" and score > 0:
+            score += 1.0
+
+        if score > 0:
+            scored.append((score, entity))
+
+    # Also search import relationships — if a file imports something matching the query,
+    # that file is probably relevant
+    for rel in graph.relationships:
+        if rel["type"] == "imports":
+            target_lower = rel["target"].lower()
+            for term in query_terms:
+                if term in target_lower:
+                    source_entity = graph.get_entity(rel["source"])
+                    if source_entity:
+                        scored.append((2.0, source_entity))
+
+    # Deduplicate and sort by score
+    seen: set[str] = set()
+    unique_scored: list[tuple[float, dict]] = []
+    for score, entity in sorted(scored, key=lambda x: -x[0]):
+        if entity["id"] not in seen:
+            seen.add(entity["id"])
+            unique_scored.append((score, entity))
+
+    # Group results by type
+    results: dict[str, list[dict]] = {"files": [], "functions": [], "classes": [], "modules": []}
+    for score, entity in unique_scored[:20]:
+        entry = {**entity, "relevance_score": score}
+        bucket = entity["type"] + "s" if entity["type"] + "s" in results else "files"
+        results.get(bucket, results["files"]).append(entry)
+
+    # Read content of top file matches so the LLM has something to work with
+    file_contents: list[dict] = []
+    for score, entity in unique_scored[:5]:
+        if entity["type"] == "file":
+            path = entity.get("metadata", {}).get("path", entity["id"])
+            content = read_file(path)
+            if "error" not in content:
+                file_contents.append({
+                    "file": path,
+                    "content": content["content"],
+                })
+
+    return {
+        "query": query,
+        "total_matches": len(unique_scored),
+        "results": results,
+        "top_file_contents": file_contents,
+    }
+
+
+@mcp.tool()
+def get_architecture(repo_path: str) -> dict:
+    """Return the architectural view of the codebase: how modules and files connect via imports.
+
+    Args:
+        repo_path: Absolute path to the repo.
+
+    Returns:
+        A dict with the import graph, module structure, and key architectural observations.
+    """
+    graph = _get_or_create_graph(repo_path)
+    if not graph.entities:
+        return {"error": "No knowledge graph found. Run build_knowledge_graph first."}
+
+    # Build the import graph: which files import what
+    import_rels = graph.find_relationships(rel_type="imports")
+    import_graph: dict[str, list[str]] = {}
+    for rel in import_rels:
+        source = rel["source"]
+        target = rel["target"]
+        if source not in import_graph:
+            import_graph[source] = []
+        import_graph[source].append(target)
+
+    # Build the containment tree: modules -> files
+    contains_rels = graph.find_relationships(rel_type="contains")
+    module_structure: dict[str, list[str]] = {}
+    for rel in contains_rels:
+        source_entity = graph.get_entity(rel["source"])
+        target_entity = graph.get_entity(rel["target"])
+        if source_entity and source_entity["type"] == "module" and target_entity:
+            if rel["source"] not in module_structure:
+                module_structure[rel["source"]] = []
+            module_structure[rel["source"]].append({
+                "id": rel["target"],
+                "name": target_entity["name"],
+                "type": target_entity["type"],
+            })
+
+    # Find the most-imported modules (dependencies many files rely on)
+    import_counts: dict[str, int] = {}
+    for targets in import_graph.values():
+        for target in targets:
+            import_counts[target] = import_counts.get(target, 0) + 1
+    most_imported = sorted(import_counts.items(), key=lambda x: -x[1])[:10]
+
+    # Find files with the most imports (high coupling)
+    most_importing = sorted(
+        [(f, len(targets)) for f, targets in import_graph.items()],
+        key=lambda x: -x[1],
+    )[:10]
+
+    return {
+        "import_graph": import_graph,
+        "module_structure": module_structure,
+        "most_depended_on": [{"module": m, "imported_by_count": c} for m, c in most_imported],
+        "highest_coupling": [{"file": f, "import_count": c} for f, c in most_importing],
+        "stats": graph.stats(),
+    }
+
+
+@mcp.tool()
+def ask(repo_path: str, question: str) -> dict:
+    """Answer a freeform question about the codebase by gathering relevant context.
+
+    Combines the knowledge graph, file contents, and project overview into a context
+    bundle that the LLM can use to answer any onboarding question.
+
+    Args:
+        repo_path: Absolute path to the repo.
+        question: Any question about the codebase (e.g., "how is auth handled?", "what does server.py do?").
+
+    Returns:
+        A dict with the question, relevant context gathered from the graph, and project overview.
+    """
+    graph = _get_or_create_graph(repo_path)
+
+    # If no graph exists yet, build one automatically
+    if not graph.entities:
+        build_result = build_knowledge_graph(repo_path)
+        if "error" in build_result:
+            return build_result
+
+    # Gather context from multiple sources
+    overview = get_overview(repo_path)
+    relevant = find_relevant_code(repo_path, question)
+
+    # Get the relationships for the most relevant files to show connections
+    connections: list[dict] = []
+    if relevant.get("top_file_contents"):
+        for fc in relevant["top_file_contents"][:3]:
+            file_path = fc["file"]
+            neighbors = graph.get_neighbors(file_path)
+            if neighbors["entity"]:
+                connections.append({
+                    "file": file_path,
+                    "imports": [r["target"] for r in neighbors["outgoing"] if r["type"] == "imports"],
+                    "contains": [r["target"] for r in neighbors["outgoing"] if r["type"] == "contains"],
+                })
+
+    return {
+        "question": question,
+        "project_overview": {
+            "name": overview.get("repo_name"),
+            "languages": overview.get("languages"),
+            "frameworks": overview.get("frameworks_and_tools"),
+            "entry_points": overview.get("entry_points"),
+        },
+        "relevant_code": {
+            "total_matches": relevant.get("total_matches", 0),
+            "results": relevant.get("results", {}),
+            "file_contents": relevant.get("top_file_contents", []),
+        },
+        "connections": connections,
+        "graph_stats": graph.stats(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# MCP Resources
+# ---------------------------------------------------------------------------
+# Resources are passive context the LLM can read without calling a tool.
+# They use the currently active repo (set when any tool is called with a repo_path).
+# The LLM or client reads them via simple URIs like repo://overview.
+
+
+@mcp.resource("repo://overview")
+def resource_overview() -> str:
+    """High-level project summary: languages, frameworks, entry points, and structure."""
+    if not _current_repo_path:
+        return json.dumps({"error": "No repo loaded. Call ingest_repo or build_knowledge_graph first."})
+    result = get_overview(_current_repo_path)
+    return json.dumps(result, indent=2)
+
+
+@mcp.resource("repo://structure")
+def resource_structure() -> str:
+    """File tree of the project."""
+    if not _current_repo_path:
+        return json.dumps({"error": "No repo loaded. Call ingest_repo or build_knowledge_graph first."})
+    result = ingest_repo(_current_repo_path)
+    return json.dumps(result, indent=2)
+
+
+@mcp.resource("repo://dependencies")
+def resource_dependencies() -> str:
+    """Dependency/import graph showing how files and modules connect."""
+    if not _current_repo_path:
+        return json.dumps({"error": "No repo loaded. Call ingest_repo or build_knowledge_graph first."})
+    result = get_architecture(_current_repo_path)
+    return json.dumps(result, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# MCP Prompts
+# ---------------------------------------------------------------------------
+# Prompts are reusable prompt templates that tell the LLM how to use the tools
+# and format responses. Clients show these as actions the user can trigger
+# (e.g., a button or slash command in Claude Desktop).
+
+
+@mcp.prompt()
+def onboard(repo_path: str) -> str:
+    """Full onboarding walkthrough for a codebase."""
+    return f"""You are an expert senior engineer onboarding a new team member to a codebase.
+
+Use the following tools to analyze the repo at: {repo_path}
+
+1. First, call `build_knowledge_graph` with repo_path="{repo_path}" to index the codebase.
+2. Then call `get_overview` with repo_path="{repo_path}" for the high-level summary.
+3. Then call `get_architecture` with repo_path="{repo_path}" to understand how components connect.
+
+Once you have all this context, provide a comprehensive onboarding guide that covers:
+- What the project does (purpose and goals)
+- Tech stack and key dependencies
+- Project structure and what each top-level directory/file is for
+- Architecture: how the main components connect
+- Entry points: where the code starts executing
+- Key files a new developer should read first
+
+Write in a friendly, clear tone. Use headers and bullet points. Be specific — reference actual file names and functions from the analysis."""
+
+
+@mcp.prompt()
+def explain_this_file(file_path: str, repo_path: str) -> str:
+    """Get a detailed explanation of what a specific file does and how it fits in the project."""
+    return f"""You are an expert engineer explaining code to a teammate.
+
+Use the following tools to analyze this file:
+
+1. Call `explain_file` with file_path="{file_path}" and repo_path="{repo_path}".
+2. Call `get_overview` with repo_path="{repo_path}" for project context.
+3. If the file imports other modules, call `query_relationships` with source="{file_path}" and rel_type="imports" to understand its dependencies.
+
+Then explain:
+- What this file does in plain English
+- How it fits into the overall project architecture
+- Key functions/classes and what they do
+- What other parts of the codebase depend on or are related to this file
+- Any patterns or conventions used in this file
+
+Be specific and reference actual code from the file."""
+
+
+@mcp.prompt()
+def find_code_for(topic: str, repo_path: str) -> str:
+    """Find and explain code related to a specific topic or feature."""
+    return f"""You are an expert engineer helping a teammate find relevant code.
+
+Use the following tools:
+
+1. Call `find_relevant_code` with repo_path="{repo_path}" and query="{topic}".
+2. For the top results, call `explain_file` on the most relevant files to get details.
+3. Call `query_relationships` to understand how the relevant files connect.
+
+Then provide:
+- Which files are most relevant to "{topic}" and why
+- Key functions/classes that handle this feature
+- How the relevant pieces connect to each other
+- A suggested reading order for understanding this part of the codebase"""
+
+
+@mcp.prompt()
+def ask_question(question: str, repo_path: str) -> str:
+    """Answer any freeform question about the codebase."""
+    return f"""You are a senior engineer who knows this codebase inside out.
+
+Call `ask` with repo_path="{repo_path}" and question="{question}".
+
+Use the returned context to answer the question thoroughly. Be specific — reference actual
+file names, function names, and code from the analysis. If the question requires deeper
+investigation, use `explain_file` or `find_relevant_code` to gather more detail.
+
+Answer in a clear, helpful tone as if explaining to a new team member."""
 
 
 if __name__ == "__main__":
