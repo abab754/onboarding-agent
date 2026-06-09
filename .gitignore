@@ -1,2 +1,8 @@
 Claude.md
 .venv/
+.onboarding_agent/
+__pycache__/
+*.pyc
+dist/
+*.egg-info/
+./claude
