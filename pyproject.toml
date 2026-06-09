@@ -1,0 +1,10 @@
+[project]
+name = "onboarding-agent"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "gitpython>=3.1.50",
+    "mcp>=1.27.2",
+]

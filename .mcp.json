@@ -1,0 +1,8 @@
+{                                                                               
+    "mcpServers": {                                                                 
+      "onboarding-agent": {                                                         
+        "command": "uv",                                                            
+        "args": ["--directory", "/Users/abhirambanda/onboarding-agent", "run", "main.py"]                                                                        
+      }                                                                             
+    }                                                                               
+  }  
