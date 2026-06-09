@@ -1,6 +1,8 @@
 import json
+from collections import Counter
 from pathlib import Path
 
+from git import Repo, InvalidGitRepositoryError
 from mcp.server.fastmcp import FastMCP
 
 from knowledge_graph import KnowledgeGraph
@@ -760,6 +762,127 @@ def ask(repo_path: str, question: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Git History Tools
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def get_git_history(repo_path: str, max_commits: int = 30) -> dict:
+    """Return recent git commit history for the repo.
+
+    Args:
+        repo_path: Absolute path to the repo.
+        max_commits: Number of recent commits to return (default 30).
+
+    Returns:
+        A dict with recent commits and contributor summary.
+    """
+    try:
+        repo = Repo(repo_path)
+    except InvalidGitRepositoryError:
+        return {"error": f"Not a git repository: {repo_path}"}
+
+    commits = []
+    author_counts: Counter[str] = Counter()
+
+    for commit in repo.iter_commits(max_count=max_commits):
+        author = f"{commit.author.name} <{commit.author.email}>"
+        author_counts[author] += 1
+        commits.append({
+            "hash": commit.hexsha[:8],
+            "message": commit.message.strip().split("\n")[0],
+            "author": commit.author.name,
+            "date": commit.committed_datetime.isoformat(),
+            "files_changed": len(commit.stats.files),
+        })
+
+    return {
+        "total_commits_shown": len(commits),
+        "commits": commits,
+        "contributors": [
+            {"name": name, "commit_count": count}
+            for name, count in author_counts.most_common()
+        ],
+    }
+
+
+@mcp.tool()
+def get_hot_files(repo_path: str, max_commits: int = 100, top_n: int = 15) -> dict:
+    """Find the most frequently changed files in the repo — these are often the most important to understand.
+
+    Args:
+        repo_path: Absolute path to the repo.
+        max_commits: How many recent commits to analyze (default 100).
+        top_n: How many top files to return (default 15).
+
+    Returns:
+        A dict with the most-changed files and their change counts.
+    """
+    try:
+        repo = Repo(repo_path)
+    except InvalidGitRepositoryError:
+        return {"error": f"Not a git repository: {repo_path}"}
+
+    file_counts: Counter[str] = Counter()
+
+    for commit in repo.iter_commits(max_count=max_commits):
+        for file_path in commit.stats.files:
+            file_counts[file_path] += 1
+
+    hot_files = [
+        {"file": f, "change_count": count}
+        for f, count in file_counts.most_common(top_n)
+    ]
+
+    return {
+        "commits_analyzed": min(max_commits, sum(1 for _ in repo.iter_commits(max_count=max_commits))),
+        "hot_files": hot_files,
+    }
+
+
+@mcp.tool()
+def get_file_contributors(repo_path: str, file_path: str) -> dict:
+    """Find who has contributed to a specific file — tells a new dev who to ask about it.
+
+    Args:
+        repo_path: Absolute path to the repo.
+        file_path: Path to the file, relative to the repo root.
+
+    Returns:
+        A dict with contributors to this file and their commit counts.
+    """
+    try:
+        repo = Repo(repo_path)
+    except InvalidGitRepositoryError:
+        return {"error": f"Not a git repository: {repo_path}"}
+
+    author_counts: Counter[str] = Counter()
+    recent_commits: list[dict] = []
+
+    for commit in repo.iter_commits(paths=file_path, max_count=50):
+        author_counts[commit.author.name] += 1
+        if len(recent_commits) < 10:
+            recent_commits.append({
+                "hash": commit.hexsha[:8],
+                "message": commit.message.strip().split("\n")[0],
+                "author": commit.author.name,
+                "date": commit.committed_datetime.isoformat(),
+            })
+
+    if not author_counts:
+        return {"error": f"No git history found for: {file_path}"}
+
+    return {
+        "file": file_path,
+        "contributors": [
+            {"name": name, "commit_count": count}
+            for name, count in author_counts.most_common()
+        ],
+        "recent_commits": recent_commits,
+    }
+
+
+# ---------------------------------------------------------------------------
 # MCP Resources
 # ---------------------------------------------------------------------------
 # Resources are passive context the LLM can read without calling a tool.
@@ -813,13 +936,17 @@ Use the following tools to analyze the repo at: {repo_path}
 2. Then call `get_overview` with repo_path="{repo_path}" for the high-level summary.
 3. Then call `get_architecture` with repo_path="{repo_path}" to understand how components connect.
 
+4. Then call `get_git_history` with repo_path="{repo_path}" to see recent activity.
+5. Then call `get_hot_files` with repo_path="{repo_path}" to find the most important files.
+
 Once you have all this context, provide a comprehensive onboarding guide that covers:
 - What the project does (purpose and goals)
 - Tech stack and key dependencies
 - Project structure and what each top-level directory/file is for
 - Architecture: how the main components connect
 - Entry points: where the code starts executing
-- Key files a new developer should read first
+- Key files a new developer should read first (use the hot files data to prioritize)
+- Recent activity: what's been worked on lately and who the key contributors are
 
 Write in a friendly, clear tone. Use headers and bullet points. Be specific — reference actual file names and functions from the analysis."""
 
