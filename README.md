@@ -37,8 +37,8 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 {
   "mcpServers": {
     "onboarding-agent": {
-      "command": "uv",
-      "args": ["--directory", "/path/to/onboarding-agent", "run", "main.py"]
+      "command": "uvx",
+      "args": ["onboarding-agent"]
     }
   }
 }
@@ -52,8 +52,8 @@ Add a `.mcp.json` file to your project root (or the repo you want to onboard to)
 {
   "mcpServers": {
     "onboarding-agent": {
-      "command": "uv",
-      "args": ["--directory", "/path/to/onboarding-agent", "run", "main.py"]
+      "command": "uvx",
+      "args": ["onboarding-agent"]
     }
   }
 }
@@ -63,13 +63,22 @@ Then restart Claude Code.
 
 ### Any MCP-compatible client
 
-The server uses stdio transport. Run it with:
+The server uses stdio transport. Any MCP client can connect by running `onboarding-agent` (after pip install) or `uvx onboarding-agent`.
 
-```bash
-uv run main.py
+### Local development
+
+If you cloned the repo and want to run from source:
+
+```json
+{
+  "mcpServers": {
+    "onboarding-agent": {
+      "command": "uv",
+      "args": ["--directory", "/path/to/onboarding-agent", "run", "main.py"]
+    }
+  }
+}
 ```
-
-Any MCP client can connect via stdin/stdout.
 
 ## Usage examples
 
