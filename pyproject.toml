@@ -1,6 +1,6 @@
 [project]
 name = "onboarding-agent"
-version = "0.1.0"
+version = "0.1.1"
 description = "An MCP server that onboards you to any codebase — point it at a repo and ask questions like a senior engineer who knows the project inside out."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -12,7 +12,7 @@ dependencies = [
 ]
 
 [project.scripts]
-onboarding-agent = "main:mcp.run"
+onboarding-agent = "onboarding_agent.__main__:main"
 
 [build-system]
 requires = ["hatchling"]
